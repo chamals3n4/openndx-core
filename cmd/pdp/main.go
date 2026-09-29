@@ -78,7 +78,14 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Policy endpoints
+	mux.HandleFunc("GET /api/v1/policy/metadata", v1Handler.ListPolicyMetadata)
 	mux.HandleFunc("POST /api/v1/policy/metadata", v1Handler.CreatePolicyMetadata)
+	mux.HandleFunc("PATCH /api/v1/policy/metadata/{id}", v1Handler.PatchPolicyMetadata)
+	mux.HandleFunc("DELETE /api/v1/policy/metadata/{id}", v1Handler.DeletePolicyMetadata)
+	mux.HandleFunc(
+		"DELETE /api/v1/policy/metadata/{id}/allowlist/{applicationId}",
+		v1Handler.RevokeAllowListEntry,
+	)
 	mux.HandleFunc("POST /api/v1/policy/update-allowlist", v1Handler.UpdateAllowList)
 	mux.HandleFunc("POST /api/v1/policy/decide", v1Handler.GetPolicyDecision)
 

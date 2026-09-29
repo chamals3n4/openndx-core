@@ -7,6 +7,7 @@ import (
 	"github.com/openndx/openndx-core/internal/pdp/models"
 	"github.com/openndx/openndx-core/internal/pdp/testhelpers"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
 
@@ -20,6 +21,309 @@ func TestNewPolicyMetadataService(t *testing.T) {
 	service := NewPolicyMetadataService(db)
 	assert.NotNil(t, service)
 	assert.NotNil(t, service.db)
+}
+
+func TestPolicyMetadataService_ListPolicyMetadata(t *testing.T) {
+	db := setupTestDB(t)
+	service := NewPolicyMetadataService(db)
+
+	_, err := service.CreatePolicyMetadata(&models.PolicyMetadataCreateRequest{
+		SchemaID: "schema-123",
+		Records: []models.PolicyMetadataCreateRequestRecord{
+			{
+				FieldName:         "person.name",
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypePublic,
+			},
+			{
+				FieldName:         "person.email",
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypeRestricted,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = service.CreatePolicyMetadata(&models.PolicyMetadataCreateRequest{
+		SchemaID: "other-schema",
+		Records: []models.PolicyMetadataCreateRequestRecord{
+			{
+				FieldName:         "other.field",
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypePublic,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	resp, err := service.ListPolicyMetadata("schema-123")
+	require.NoError(t, err)
+	require.Len(t, resp.Records, 2)
+	assert.Equal(t, "person.email", resp.Records[0].FieldName)
+	assert.Equal(t, "person.name", resp.Records[1].FieldName)
+	assert.Equal(t, "schema-123", resp.Records[0].SchemaID)
+	assert.Equal(t, "schema-123", resp.Records[1].SchemaID)
+
+	allResp, err := service.ListPolicyMetadata("")
+	require.NoError(t, err)
+	require.Len(t, allResp.Records, 3)
+	assert.Equal(t, "other-schema", allResp.Records[0].SchemaID)
+	assert.Equal(t, "schema-123", allResp.Records[1].SchemaID)
+	assert.Equal(t, "schema-123", allResp.Records[2].SchemaID)
+
+	emptyResp, err := service.ListPolicyMetadata("missing-schema")
+	require.NoError(t, err)
+	assert.Empty(t, emptyResp.Records)
+}
+
+func TestPolicyMetadataService_PatchPolicyMetadata(t *testing.T) {
+	db := setupTestDB(t)
+	service := NewPolicyMetadataService(db)
+
+	createResp, err := service.CreatePolicyMetadata(&models.PolicyMetadataCreateRequest{
+		SchemaID: "schema-123",
+		Records: []models.PolicyMetadataCreateRequestRecord{
+			{
+				FieldName:         "person.name",
+				DisplayName:       testhelpers.StringPtr("Name"),
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypePublic,
+			},
+			{
+				FieldName:         "person.email",
+				DisplayName:       testhelpers.StringPtr("Email"),
+				Description:       testhelpers.StringPtr("Old description"),
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypePublic,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, createResp.Records, 2)
+
+	_, err = service.UpdateAllowList(&models.AllowListUpdateRequest{
+		ApplicationID: "app-123",
+		GrantDuration: models.GrantDurationTypeOneMonth,
+		Records: []models.AllowListUpdateRequestRecord{
+			{FieldName: "person.email", SchemaID: "schema-123"},
+		},
+	})
+	require.NoError(t, err)
+
+	id := createResp.Records[1].ID
+
+	restricted := models.AccessControlTypeRestricted
+	resp, err := service.PatchPolicyMetadata(id, &models.PolicyMetadataPatchRequest{
+		DisplayName: models.OptionalPatchField[string]{
+			Set:   true,
+			Value: testhelpers.StringPtr("Primary Email"),
+		},
+		Description: models.OptionalPatchField[string]{
+			Set:   true,
+			Value: nil,
+		},
+		AccessControlType: models.OptionalPatchField[models.AccessControlType]{
+			Set:   true,
+			Value: &restricted,
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.DisplayName)
+	assert.Equal(t, "Primary Email", *resp.DisplayName)
+	assert.Nil(t, resp.Description)
+	assert.Equal(t, models.AccessControlTypeRestricted, resp.AccessControlType)
+	assert.Contains(t, resp.AllowList, "app-123")
+
+	var count int64
+	require.NoError(t, db.Model(&models.PolicyMetadata{}).
+		Where("schema_id = ?", "schema-123").
+		Count(&count).Error)
+	assert.Equal(t, int64(2), count)
+
+	var nameRecord models.PolicyMetadata
+	require.NoError(t, db.Where(
+		"schema_id = ? AND field_name = ?",
+		"schema-123",
+		"person.name",
+	).First(&nameRecord).Error)
+	require.NotNil(t, nameRecord.DisplayName)
+	assert.Equal(t, "Name", *nameRecord.DisplayName)
+
+	// Reject any SQL statement that updates access_control_type. A display-only
+	// patch must still succeed because it should update only the supplied field.
+	require.NoError(t, db.Exec(`
+		CREATE TRIGGER reject_access_control_type_update
+		BEFORE UPDATE OF access_control_type ON policy_metadata
+		BEGIN
+			SELECT RAISE(FAIL, 'access_control_type was unexpectedly updated');
+		END;
+	`).Error)
+
+	displayOnlyResp, err := service.PatchPolicyMetadata(id, &models.PolicyMetadataPatchRequest{
+		DisplayName: models.OptionalPatchField[string]{
+			Set:   true,
+			Value: testhelpers.StringPtr("Contact Email"),
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, displayOnlyResp.DisplayName)
+	assert.Equal(t, "Contact Email", *displayOnlyResp.DisplayName)
+	assert.Equal(t, models.AccessControlTypeRestricted, displayOnlyResp.AccessControlType)
+
+	_, err = service.PatchPolicyMetadata("not-a-uuid", &models.PolicyMetadataPatchRequest{})
+	assert.ErrorIs(t, err, ErrPolicyMetadataNotFound)
+}
+
+func TestPolicyMetadataService_DeletePolicyMetadata(t *testing.T) {
+	db := setupTestDB(t)
+	service := NewPolicyMetadataService(db)
+
+	createResp, err := service.CreatePolicyMetadata(&models.PolicyMetadataCreateRequest{
+		SchemaID: "schema-123",
+		Records: []models.PolicyMetadataCreateRequestRecord{
+			{
+				FieldName:         "person.name",
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypePublic,
+			},
+			{
+				FieldName:         "person.email",
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypeRestricted,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, createResp.Records, 2)
+
+	id := createResp.Records[1].ID
+	require.NoError(t, service.DeletePolicyMetadata(id))
+
+	var records []models.PolicyMetadata
+	require.NoError(t, db.Where("schema_id = ?", "schema-123").Find(&records).Error)
+	require.Len(t, records, 1)
+	assert.Equal(t, "person.name", records[0].FieldName)
+
+	err = service.DeletePolicyMetadata(id)
+	assert.ErrorIs(t, err, ErrPolicyMetadataNotFound)
+}
+
+func TestPolicyMetadataService_RevokeAllowListEntry(t *testing.T) {
+	db := setupTestDB(t)
+	service := NewPolicyMetadataService(db)
+
+	createResp, err := service.CreatePolicyMetadata(&models.PolicyMetadataCreateRequest{
+		SchemaID: "schema-123",
+		Records: []models.PolicyMetadataCreateRequestRecord{
+			{
+				FieldName:         "person.email",
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypeRestricted,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, createResp.Records, 1)
+
+	for _, applicationID := range []string{"app-123", "app-456"} {
+		_, err = service.UpdateAllowList(&models.AllowListUpdateRequest{
+			ApplicationID: applicationID,
+			GrantDuration: models.GrantDurationTypeOneMonth,
+			Records: []models.AllowListUpdateRequestRecord{
+				{FieldName: "person.email", SchemaID: "schema-123"},
+			},
+		})
+		require.NoError(t, err)
+	}
+
+	id := createResp.Records[0].ID
+	require.NoError(t, service.RevokeAllowListEntry(id, "app-123"))
+
+	var policyMetadata models.PolicyMetadata
+	require.NoError(t, db.First(&policyMetadata, "id = ?", id).Error)
+	assert.NotContains(t, policyMetadata.AllowList, "app-123")
+	assert.Contains(t, policyMetadata.AllowList, "app-456")
+
+	err = service.RevokeAllowListEntry(id, "app-123")
+	assert.ErrorIs(t, err, ErrAllowListEntryNotFound)
+
+	err = service.RevokeAllowListEntry("not-a-uuid", "app-456")
+	assert.ErrorIs(t, err, ErrPolicyMetadataNotFound)
+}
+
+// TestCreatePolicyMetadata_DoesNotUpdateAllowList verifies that schema
+// synchronization cannot restore a stale allow-list entry.
+func TestCreatePolicyMetadata_DoesNotUpdateAllowList(t *testing.T) {
+	db := setupTestDB(t)
+	service := NewPolicyMetadataService(db)
+
+	_, err := service.CreatePolicyMetadata(&models.PolicyMetadataCreateRequest{
+		SchemaID: "schema-123",
+		Records: []models.PolicyMetadataCreateRequestRecord{
+			{
+				FieldName:         "person.email",
+				DisplayName:       testhelpers.StringPtr("Email"),
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypeRestricted,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = service.UpdateAllowList(&models.AllowListUpdateRequest{
+		ApplicationID: "app-A",
+		GrantDuration: models.GrantDurationTypeOneMonth,
+		Records: []models.AllowListUpdateRequestRecord{
+			{FieldName: "person.email", SchemaID: "schema-123"},
+		},
+	})
+	require.NoError(t, err)
+
+	// Simulate a concurrent revoke after schema synchronization has read the
+	// stale row but immediately before it writes its metadata update.
+	require.NoError(t, db.Exec(`
+		CREATE TRIGGER revoke_before_schema_sync_update
+		BEFORE UPDATE OF display_name ON policy_metadata
+		BEGIN
+			UPDATE policy_metadata
+			SET allow_list = '{}'
+			WHERE id = OLD.id;
+		END;
+	`).Error)
+
+	_, err = service.CreatePolicyMetadata(&models.PolicyMetadataCreateRequest{
+		SchemaID: "schema-123",
+		Records: []models.PolicyMetadataCreateRequestRecord{
+			{
+				FieldName:         "person.email",
+				DisplayName:       testhelpers.StringPtr("Primary Email"),
+				Source:            models.SourcePrimary,
+				IsOwner:           true,
+				AccessControlType: models.AccessControlTypeRestricted,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	var policyMetadata models.PolicyMetadata
+	require.NoError(t, db.Where(
+		"schema_id = ? AND field_name = ?",
+		"schema-123",
+		"person.email",
+	).First(&policyMetadata).Error)
+	require.NotNil(t, policyMetadata.DisplayName)
+	assert.Equal(t, "Primary Email", *policyMetadata.DisplayName)
+	assert.NotContains(t, policyMetadata.AllowList, "app-A")
+	assert.Empty(t, policyMetadata.AllowList)
 }
 
 func TestPolicyMetadataService_CreatePolicyMetadata_EdgeCases(t *testing.T) {
